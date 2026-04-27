@@ -56,7 +56,7 @@ from zenml.utils.run_utils import (
     find_all_downstream_steps,
 )
 from zenml.utils.time_utils import utc_now
-from zenml.zen_stores.schemas.base_schemas import NamedSchema
+from zenml.zen_stores.schemas.base_schemas import BaseSchema, NamedSchema
 from zenml.zen_stores.schemas.constants import MODEL_VERSION_TABLENAME
 from zenml.zen_stores.schemas.pipeline_build_schemas import PipelineBuildSchema
 from zenml.zen_stores.schemas.pipeline_schemas import PipelineSchema
@@ -76,6 +76,7 @@ from zenml.zen_stores.schemas.utils import (
 )
 
 if TYPE_CHECKING:
+    from zenml.zen_stores.schemas.artifact_schemas import ArtifactVersionSchema
     from zenml.zen_stores.schemas.curated_visualization_schemas import (
         CuratedVisualizationSchema,
     )
@@ -254,8 +255,34 @@ class PipelineRunSchema(NamedSchema, RunMetadataInterface, table=True):
         ondelete="SET NULL",
         nullable=True,
     )
+    parent_run_id: Optional[UUID] = build_foreign_key_field(
+        source=__tablename__,
+        target=__tablename__,
+        source_column="parent_run_id",
+        target_column="id",
+        ondelete="SET NULL",
+        nullable=True,
+    )
     original_run: Optional["PipelineRunSchema"] = Relationship(
-        sa_relationship_kwargs={"remote_side": "PipelineRunSchema.id"}
+        sa_relationship_kwargs={
+            "remote_side": "PipelineRunSchema.id",
+            "foreign_keys": "[PipelineRunSchema.original_run_id]",
+        }
+    )
+    parent_run: Optional["PipelineRunSchema"] = Relationship(
+        sa_relationship_kwargs={
+            "remote_side": "PipelineRunSchema.id",
+            "foreign_keys": "[PipelineRunSchema.parent_run_id]",
+        }
+    )
+    child_runs: List["PipelineRunSchema"] = Relationship(
+        sa_relationship_kwargs={
+            "viewonly": True,
+            "primaryjoin": "foreign(PipelineRunSchema.parent_run_id) == PipelineRunSchema.id",
+        }
+    )
+    pipeline_outputs: List["PipelineRunOutputSchema"] = Relationship(
+        sa_relationship_kwargs={"cascade": "delete"}
     )
 
     stack: Optional["StackSchema"] = Relationship()
@@ -346,12 +373,14 @@ class PipelineRunSchema(NamedSchema, RunMetadataInterface, table=True):
             options.extend(
                 [
                     selectinload(jl_arg(PipelineRunSchema.trigger_execution)),
+                    selectinload(jl_arg(PipelineRunSchema.pipeline_outputs)),
                 ]
             )
 
         if include_resources:
             options.extend(
                 [
+                    selectinload(jl_arg(PipelineRunSchema.parent_run)),
                     selectinload(
                         jl_arg(PipelineRunSchema.model_version)
                     ).joinedload(
@@ -448,6 +477,7 @@ class PipelineRunSchema(NamedSchema, RunMetadataInterface, table=True):
             if request.exception_info
             else None,
             original_run_id=request.original_run_id,
+            parent_run_id=request.parent_run_id,
         )
 
     def get_pipeline_configuration(self) -> PipelineConfiguration:
@@ -699,6 +729,10 @@ class PipelineRunSchema(NamedSchema, RunMetadataInterface, table=True):
                 trigger_execution_info=json.loads(self.trigger_execution.info)
                 if self.trigger_execution and self.trigger_execution.info
                 else None,
+                outputs={
+                    output.name: output.artifact_id
+                    for output in self.pipeline_outputs
+                },
             )
 
         resources = None
@@ -767,6 +801,9 @@ class PipelineRunSchema(NamedSchema, RunMetadataInterface, table=True):
                 trigger=self.trigger.to_model() if self.trigger else None,
                 original_run=self.original_run.to_model()
                 if self.original_run
+                else None,
+                parent_run=self.parent_run.to_model()
+                if self.parent_run
                 else None,
                 active_wait_condition=next(
                     (
@@ -1133,6 +1170,44 @@ class PipelineRunSchema(NamedSchema, RunMetadataInterface, table=True):
                     )
 
         return False
+
+
+class PipelineRunOutputSchema(BaseSchema, table=True):
+    """SQL model defining pipeline run outputs."""
+
+    __tablename__ = "pipeline_run_output"
+    __table_args__ = (
+        UniqueConstraint(
+            "pipeline_run_id",
+            "name",
+            name="unique_pipeline_run_output_name",
+        ),
+    )
+
+    name: str = Field(nullable=False)
+    pipeline_run_id: UUID = build_foreign_key_field(
+        source=__tablename__,
+        target=PipelineRunSchema.__tablename__,
+        source_column="pipeline_run_id",
+        target_column="id",
+        ondelete="CASCADE",
+        nullable=False,
+    )
+    artifact_id: UUID = build_foreign_key_field(
+        source=__tablename__,
+        target="artifact_version",
+        source_column="artifact_id",
+        target_column="id",
+        ondelete="RESTRICT",
+        nullable=False,
+    )
+
+    pipeline_run: PipelineRunSchema = Relationship(
+        back_populates="pipeline_outputs"
+    )
+    artifact_version: "ArtifactVersionSchema" = Relationship(
+        sa_relationship_kwargs={"lazy": "joined"}
+    )
 
 
 def _compute_static_pipeline_run_status(

@@ -287,6 +287,60 @@ The `StepRunFuture` object provides several methods:
 When using `step.submit()`, steps with `runtime="isolated"` will execute in separate containers/processes, while steps with `runtime="inline"` will execute in separate threads within the orchestration environment.
 {% endhint %}
 
+### Sub-pipelines inside dynamic pipelines
+
+Dynamic pipelines can call other dynamic pipelines from their `@pipeline`
+body. This is useful for composing larger workflows out of reusable dynamic
+building blocks.
+
+Key behavior:
+
+- Only dynamic pipelines can be called as sub-pipelines.
+- Sub-pipelines run on the same stack as the parent run.
+- Sub-pipelines can run synchronously (`child(...)`) or concurrently
+  (`child.submit(...)`).
+- Sub-pipeline calls are only allowed in pipeline bodies, not inside step
+  functions.
+
+Sub-pipeline outputs are returned as artifact references:
+
+- `None`
+- A single output artifact
+- A tuple of output artifacts
+
+These outputs can be passed directly to downstream steps.
+
+```python
+from zenml import pipeline, step
+
+@step
+def produce_number() -> int:
+    return 42
+
+@pipeline(dynamic=True)
+def child_pipeline():
+    return produce_number()
+
+@step
+def consume_number(value: int) -> None:
+    print(value)
+
+@pipeline(dynamic=True)
+def parent_pipeline():
+    child_output = child_pipeline()
+    consume_number(child_output)
+```
+
+For concurrent execution, use `submit()` and wait on the future:
+
+```python
+@pipeline(dynamic=True)
+def parent_pipeline_concurrent():
+    future = child_pipeline.submit()
+    child_output = future.result()
+    consume_number(child_output)
+```
+
 ### Config Templates with `depends_on`
 
 You can use YAML configuration files to provide default parameters for steps using the `depends_on` parameter:

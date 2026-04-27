@@ -5149,6 +5149,7 @@ class Client(metaclass=ClientMetaClass):
         triggered_by_step_run_id: Optional[Union[UUID, str]] = None,
         triggered_by_deployment_id: Optional[Union[UUID, str]] = None,
         trigger_id: UUID | str | None = None,
+        parent_run_id: Optional[Union[str, UUID]] = None,
     ) -> Page[PipelineRunResponse]:
         """List all pipeline runs.
 
@@ -5203,6 +5204,7 @@ class Client(metaclass=ClientMetaClass):
             triggered_by_deployment_id: The ID of the deployment that triggered
                 the pipeline run.
             trigger_id: The ID of the trigger that generated this run.
+            parent_run_id: The parent run ID for nested sub-pipeline runs.
 
         Returns:
             A page with Pipeline Runs fitting the filter description
@@ -5247,6 +5249,7 @@ class Client(metaclass=ClientMetaClass):
             triggered_by_step_run_id=triggered_by_step_run_id,
             triggered_by_deployment_id=triggered_by_deployment_id,
             trigger_id=trigger_id,
+            parent_run_id=parent_run_id,
         )
         return self.zen_store.list_runs(
             runs_filter_model=runs_filter_model,

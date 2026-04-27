@@ -19,7 +19,10 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
     Type,
+    Union,
+    cast,
 )
 
 from pydantic import BaseModel, ConfigDict, create_model
@@ -31,7 +34,6 @@ from zenml.execution.pipeline.utils import (
     should_prevent_pipeline_execution,
 )
 from zenml.logger import get_logger
-from zenml.models import PipelineRunResponse
 from zenml.pipelines.pipeline_definition import Pipeline
 from zenml.steps.utils import (
     parse_return_type_annotations,
@@ -39,6 +41,10 @@ from zenml.steps.utils import (
 from zenml.utils import source_utils
 
 if TYPE_CHECKING:
+    from zenml.execution.pipeline.dynamic.outputs import (
+        AnyStepFuture,
+        PipelineFuture,
+    )
     from zenml.steps import BaseStep
 
 logger = get_logger(__name__)
@@ -150,9 +156,97 @@ class DynamicPipeline(Pipeline):
                 upstream_steps=set(),
             )
 
-    def __call__(
-        self, *args: Any, **kwargs: Any
-    ) -> Optional[PipelineRunResponse]:
+    def _submit_subpipeline(
+        self,
+        *args: Any,
+        concurrent: bool,
+        after: Union[
+            "AnyStepFuture",
+            Sequence["AnyStepFuture"],
+            None,
+        ] = None,
+        **kwargs: Any,
+    ) -> Union["PipelineFuture", Any]:
+        """Submit this dynamic pipeline as a sub-pipeline.
+
+        Args:
+            *args: Entrypoint function arguments.
+            concurrent: Whether to run the sub-pipeline concurrently.
+            after: Optional dependency futures.
+            **kwargs: Entrypoint function keyword arguments.
+
+        Raises:
+            RuntimeError: If called outside a dynamic run or inside a step
+                body.
+
+        Returns:
+            A pipeline future for concurrent mode or resolved outputs for sync
+            mode.
+        """
+        from zenml.execution.pipeline.dynamic.run_context import (
+            DynamicPipelineRunContext,
+        )
+        from zenml.steps.step_context import StepContext
+
+        run_context = DynamicPipelineRunContext.get()
+        if not run_context:
+            raise RuntimeError(
+                "Submitting a pipeline is only possible within a dynamic "
+                "pipeline run context."
+            )
+
+        if StepContext.get():
+            raise RuntimeError(
+                "Sub-pipeline calls are only allowed in a dynamic @pipeline "
+                "body, not inside step bodies."
+            )
+
+        # TODO: Add support for PipelineFuture in `after=` dependencies.
+        if after is None:
+            after_list = None
+        elif isinstance(after, (list, tuple)):
+            after_list = after
+        else:
+            after_list = [after]
+        return run_context.runner.submit_subpipeline(
+            pipeline=self,
+            args=args,
+            kwargs=kwargs,
+            concurrent=concurrent,
+            after=cast(Optional[Sequence["AnyStepFuture"]], after_list),
+        )
+
+    def submit(
+        self,
+        *args: Any,
+        after: Union[
+            "AnyStepFuture",
+            Sequence["AnyStepFuture"],
+            None,
+        ] = None,
+        **kwargs: Any,
+    ) -> "PipelineFuture":
+        """Submit the pipeline to run concurrently as a sub-pipeline.
+
+        Args:
+            *args: Entrypoint function arguments.
+            after: Optional dependency futures.
+            **kwargs: Entrypoint function keyword arguments.
+
+        Returns:
+            The sub-pipeline future.
+        """
+        return cast(
+            "PipelineFuture",
+            self._submit_subpipeline(
+                *args,
+                concurrent=True,
+                after=after,
+                **kwargs,
+            ),
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run the pipeline on the active stack.
 
         Args:
@@ -164,8 +258,21 @@ class DynamicPipeline(Pipeline):
                 dynamic pipelines.
 
         Returns:
-            The pipeline run or `None` if running with a schedule.
+            The sub-pipeline outputs when called from a dynamic run context,
+            otherwise the top-level pipeline run or `None` if running with a
+            schedule.
         """
+        from zenml.execution.pipeline.dynamic.run_context import (
+            DynamicPipelineRunContext,
+        )
+
+        if DynamicPipelineRunContext.get():
+            return self._submit_subpipeline(
+                *args,
+                concurrent=False,
+                **kwargs,
+            )
+
         if should_prevent_pipeline_execution():
             logger.info("Preventing execution of pipeline '%s'.", self.name)
             return None

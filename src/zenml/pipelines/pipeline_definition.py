@@ -127,6 +127,229 @@ logger = get_logger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+_SnapshotBuildAndCodeResult = Tuple[
+    Optional["PipelineBuildResponse"],
+    Optional[CodeReferenceRequest],
+    Optional[str],
+]
+
+
+class _SnapshotCreationStrategy:
+    """Strategy interface for snapshot build and code resolution."""
+
+    def prepare_source_context(
+        self, snapshot: PipelineSnapshotBase, stack: Stack
+    ) -> Tuple[Optional[Any], Optional[Any], bool]:
+        """Prepare source context needed to resolve build and code details.
+
+        Args:
+            snapshot: Compiled pipeline snapshot.
+            stack: Active stack.
+
+        Returns:
+            A tuple of `(local_repo_context, code_repository,
+            can_download_from_code_repository)`.
+        """
+        return None, None, False
+
+    def resolve_build_and_code(
+        self,
+        *,
+        snapshot: PipelineSnapshotBase,
+        pipeline_id: UUID,
+        build: Union[str, "UUID", "PipelineBuildBase", None],
+        prevent_build_reuse: bool,
+        local_repo_context: Optional[Any],
+        code_repository: Optional[Any],
+        can_download_from_code_repository: bool,
+    ) -> _SnapshotBuildAndCodeResult:
+        """Resolve build and code settings for snapshot creation.
+
+        Args:
+            snapshot: Compiled pipeline snapshot.
+            pipeline_id: Pipeline ID.
+            build: Explicit build argument, if provided.
+            prevent_build_reuse: Whether build reuse should be disabled.
+            local_repo_context: Active local repository context.
+            code_repository: Verified code repository model.
+            can_download_from_code_repository: Whether code download is
+                available from the repository.
+
+        Returns:
+            A tuple of `(build_model, code_reference, code_path)`.
+        """
+        raise NotImplementedError()
+
+
+class _DefaultSnapshotCreationStrategy(_SnapshotCreationStrategy):
+    """Default snapshot creation strategy for top-level pipeline runs."""
+
+    def prepare_source_context(
+        self, snapshot: PipelineSnapshotBase, stack: Stack
+    ) -> Tuple[Optional[Any], Optional[Any], bool]:
+        """Prepare notebook and repository context for top-level runs.
+
+        Args:
+            snapshot: Compiled pipeline snapshot.
+            stack: Active stack.
+
+        Returns:
+            A tuple of `(local_repo_context, code_repository,
+            can_download_from_code_repository)`.
+        """
+        upload_notebook_cell_code_if_necessary(snapshot=snapshot, stack=stack)
+        local_repo_context = (
+            code_repository_utils.find_active_code_repository()
+        )
+        code_repository = build_utils.verify_local_repository_context(
+            snapshot=snapshot, local_repo_context=local_repo_context
+        )
+        can_download_from_code_repository = code_repository is not None
+        if local_repo_context:
+            build_utils.log_code_repository_usage(
+                snapshot=snapshot, local_repo_context=local_repo_context
+            )
+        return (
+            local_repo_context,
+            code_repository,
+            can_download_from_code_repository,
+        )
+
+    def resolve_build_and_code(
+        self,
+        *,
+        snapshot: PipelineSnapshotBase,
+        pipeline_id: UUID,
+        build: Union[str, "UUID", "PipelineBuildBase", None],
+        prevent_build_reuse: bool,
+        local_repo_context: Optional[Any],
+        code_repository: Optional[Any],
+        can_download_from_code_repository: bool,
+    ) -> _SnapshotBuildAndCodeResult:
+        """Resolve build and code settings for top-level runs.
+
+        Args:
+            snapshot: Compiled pipeline snapshot.
+            pipeline_id: Pipeline ID.
+            build: Explicit build argument, if provided.
+            prevent_build_reuse: Whether build reuse should be disabled.
+            local_repo_context: Active local repository context.
+            code_repository: Verified code repository model.
+            can_download_from_code_repository: Whether code download is
+                available from the repository.
+
+        Returns:
+            A tuple of `(build_model, code_reference, code_path)`.
+        """
+        build_model = build_utils.reuse_or_create_pipeline_build(
+            snapshot=snapshot,
+            pipeline_id=pipeline_id,
+            allow_build_reuse=not prevent_build_reuse,
+            build=build,
+            code_repository=code_repository,
+        )
+        code_reference = None
+        code_path = None
+        if local_repo_context and not local_repo_context.is_dirty:
+            source_root = source_utils.get_source_root()
+            subdirectory = (
+                Path(source_root)
+                .resolve()
+                .relative_to(local_repo_context.root)
+            )
+            code_reference = CodeReferenceRequest(
+                commit=local_repo_context.current_commit,
+                subdirectory=subdirectory.as_posix(),
+                code_repository=local_repo_context.code_repository.id,
+            )
+
+        if build_utils.should_upload_code(
+            snapshot=snapshot,
+            build=build_model,
+            can_download_from_code_repository=can_download_from_code_repository,
+        ):
+            source_root = source_utils.get_source_root()
+            code_archive = code_utils.CodeArchive(root=source_root)
+            logger.info(
+                "Archiving pipeline code directory: `%s`. If this is taking "
+                "longer than you expected, make sure your source root "
+                "is set correctly by running `zenml init`, and that it "
+                "does not contain unnecessarily huge files.",
+                source_root,
+            )
+            code_path = code_utils.upload_code_if_necessary(code_archive)
+
+        return build_model, code_reference, code_path
+
+
+class _SubPipelineSnapshotCreationStrategy(_SnapshotCreationStrategy):
+    """Snapshot creation strategy for nested sub-pipeline runs."""
+
+    def __init__(self, parent_snapshot: PipelineSnapshotResponse) -> None:
+        """Initialize the strategy with parent snapshot information.
+
+        Args:
+            parent_snapshot: Snapshot of the parent dynamic pipeline run.
+        """
+        self._parent_snapshot = parent_snapshot
+
+    def resolve_build_and_code(
+        self,
+        *,
+        snapshot: PipelineSnapshotBase,
+        pipeline_id: UUID,
+        build: Union[str, "UUID", "PipelineBuildBase", None],
+        prevent_build_reuse: bool,
+        local_repo_context: Optional[Any],
+        code_repository: Optional[Any],
+        can_download_from_code_repository: bool,
+    ) -> _SnapshotBuildAndCodeResult:
+        """Resolve build and code settings by inheriting from parent run.
+
+        Args:
+            snapshot: Compiled pipeline snapshot.
+            pipeline_id: Pipeline ID.
+            build: Explicit build argument, if provided.
+            prevent_build_reuse: Whether build reuse should be disabled.
+            local_repo_context: Active local repository context.
+            code_repository: Verified code repository model.
+            can_download_from_code_repository: Whether code download is
+                available from the repository.
+
+        Returns:
+            A tuple of `(build_model, code_reference, code_path)`.
+        """
+        del pipeline_id
+        del build
+        del prevent_build_reuse
+        del local_repo_context
+        del code_repository
+        del can_download_from_code_repository
+
+        parent_build = self._parent_snapshot.build
+        if parent_build:
+            from zenml.config.constants import DOCKER_SETTINGS_KEY
+            from zenml.constants import ORCHESTRATOR_DOCKER_IMAGE_KEY
+
+            parent_image = parent_build.get_image(
+                component_key=ORCHESTRATOR_DOCKER_IMAGE_KEY
+            )
+            snapshot.pipeline_configuration.settings[DOCKER_SETTINGS_KEY] = (
+                snapshot.pipeline_configuration.docker_settings.model_copy(
+                    update={"skip_build": True, "parent_image": parent_image}
+                )
+            )
+
+        code_reference = None
+        if self._parent_snapshot.code_reference:
+            code_reference = CodeReferenceRequest(
+                commit=self._parent_snapshot.code_reference.commit,
+                subdirectory=self._parent_snapshot.code_reference.subdirectory,
+                code_repository=self._parent_snapshot.code_reference.code_repository.id,
+            )
+        return parent_build, code_reference, self._parent_snapshot.code_path
+
+
 class Pipeline:
     """ZenML pipeline class."""
 
@@ -951,19 +1174,14 @@ To avoid this consider setting pipeline parameters only in one place (config or 
 
         stack = Client().active_stack
         stack.validate()
-        upload_notebook_cell_code_if_necessary(snapshot=snapshot, stack=stack)
-
-        local_repo_context = (
-            code_repository_utils.find_active_code_repository()
+        snapshot_strategy = self._get_snapshot_creation_strategy()
+        (
+            local_repo_context,
+            code_repository,
+            can_download_from_code_repository,
+        ) = snapshot_strategy.prepare_source_context(
+            snapshot=snapshot, stack=stack
         )
-        code_repository = build_utils.verify_local_repository_context(
-            snapshot=snapshot, local_repo_context=local_repo_context
-        )
-        can_download_from_code_repository = code_repository is not None
-        if local_repo_context:
-            build_utils.log_code_repository_usage(
-                snapshot=snapshot, local_repo_context=local_repo_context
-            )
 
         if prevent_build_reuse:
             logger.warning(
@@ -972,47 +1190,18 @@ To avoid this consider setting pipeline parameters only in one place (config or 
                 "`DockerSettings.prevent_build_reuse` instead."
             )
 
-        build_model = build_utils.reuse_or_create_pipeline_build(
-            snapshot=snapshot,
-            pipeline_id=pipeline_id,
-            allow_build_reuse=not prevent_build_reuse,
-            build=build,
-            code_repository=code_repository,
+        build_model, code_reference, code_path = (
+            snapshot_strategy.resolve_build_and_code(
+                snapshot=snapshot,
+                pipeline_id=pipeline_id,
+                build=build,
+                prevent_build_reuse=prevent_build_reuse,
+                local_repo_context=local_repo_context,
+                code_repository=code_repository,
+                can_download_from_code_repository=can_download_from_code_repository,
+            )
         )
         build_id = build_model.id if build_model else None
-
-        code_reference = None
-        if local_repo_context and not local_repo_context.is_dirty:
-            source_root = source_utils.get_source_root()
-            subdirectory = (
-                Path(source_root)
-                .resolve()
-                .relative_to(local_repo_context.root)
-            )
-
-            code_reference = CodeReferenceRequest(
-                commit=local_repo_context.current_commit,
-                subdirectory=subdirectory.as_posix(),
-                code_repository=local_repo_context.code_repository.id,
-            )
-
-        code_path = None
-        if build_utils.should_upload_code(
-            snapshot=snapshot,
-            build=build_model,
-            can_download_from_code_repository=can_download_from_code_repository,
-        ):
-            source_root = source_utils.get_source_root()
-            code_archive = code_utils.CodeArchive(root=source_root)
-            logger.info(
-                "Archiving pipeline code directory: `%s`. If this is taking "
-                "longer than you expected, make sure your source root "
-                "is set correctly by running `zenml init`, and that it "
-                "does not contain unnecessarily huge files.",
-                source_root,
-            )
-
-            code_path = code_utils.upload_code_if_necessary(code_archive)
 
         request = PipelineSnapshotRequest(
             project=Client().active_project.id,
@@ -1027,6 +1216,23 @@ To avoid this consider setting pipeline parameters only in one place (config or 
             **snapshot_request_kwargs,
         )
         return Client().zen_store.create_snapshot(snapshot=request)
+
+    def _get_snapshot_creation_strategy(self) -> _SnapshotCreationStrategy:
+        """Get the snapshot creation strategy for the current execution context.
+
+        Returns:
+            Strategy used to resolve build and code settings.
+        """
+        from zenml.execution.pipeline.dynamic.run_context import (
+            DynamicPipelineRunContext,
+        )
+
+        dynamic_context = DynamicPipelineRunContext.get()
+        if dynamic_context:
+            return _SubPipelineSnapshotCreationStrategy(
+                parent_snapshot=dynamic_context.snapshot
+            )
+        return _DefaultSnapshotCreationStrategy()
 
     def _run(
         self,

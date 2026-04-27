@@ -19,7 +19,7 @@ import inspect
 import itertools
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import timedelta
 from typing import (
@@ -40,7 +40,7 @@ from typing import (
     Union,
     overload,
 )
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter
 
@@ -84,6 +84,7 @@ from zenml.execution.pipeline.dynamic.invocation_dependency_graph import (
     MapNode,
     NodeState,
     StepNode,
+    SubPipelineNode,
 )
 from zenml.execution.pipeline.dynamic.outputs import (
     AnyStepFuture,
@@ -91,11 +92,15 @@ from zenml.execution.pipeline.dynamic.outputs import (
     BaseStepFuture,
     MapResultsFuture,
     OutputArtifact,
+    PipelineFuture,
     StepExecutionFuture,
     StepFuture,
     StepRunOutputs,
     _InlineStepFuture,
     _IsolatedStepFuture,
+)
+from zenml.execution.pipeline.dynamic.pipeline_output_utils import (
+    prepare_pipeline_output_update,
 )
 from zenml.execution.pipeline.dynamic.run_context import (
     DynamicPipelineRunContext,
@@ -124,7 +129,6 @@ from zenml.orchestrators.publish_utils import (
     publish_failed_pipeline_run,
     publish_failed_step_run,
     publish_stopped_step_run,
-    publish_successful_pipeline_run,
 )
 from zenml.pipelines.dynamic.pipeline_definition import DynamicPipeline
 from zenml.pipelines.run_utils import create_placeholder_run
@@ -132,7 +136,10 @@ from zenml.stack import Stack
 from zenml.steps import BaseStep
 from zenml.steps.entrypoint_function_utils import StepArtifact
 from zenml.steps.step_invocation import StepInvocation
-from zenml.steps.utils import OutputSignature
+from zenml.steps.utils import (
+    OutputSignature,
+    parse_return_type_annotations,
+)
 from zenml.utils import (
     env_utils,
     exception_utils,
@@ -178,6 +185,7 @@ class DynamicPipelineRunner:
         snapshot: "PipelineSnapshotResponse",
         run: Optional["PipelineRunResponse"],
         orchestrator: Optional["BaseOrchestrator"] = None,
+        orchestrator_run_id: Optional[str] = None,
     ) -> None:
         """Initialize the dynamic pipeline runner.
 
@@ -186,6 +194,7 @@ class DynamicPipelineRunner:
             run: The pipeline run.
             orchestrator: The orchestrator to use. If not provided, the
                 orchestrator will be inferred from the snapshot stack.
+            orchestrator_run_id: Optional explicit orchestrator run ID.
 
         Raises:
             RuntimeError: If the snapshot has no associated stack.
@@ -227,7 +236,9 @@ class DynamicPipelineRunner:
         self._invocation_id_lock = threading.Lock()
         self._invocation_ids: Set[str] = set()
 
-        self._run, self._orchestrator_run_id = self._prepare_run(run)
+        self._run, self._orchestrator_run_id = self._prepare_run(
+            run, orchestrator_run_id=orchestrator_run_id
+        )
         self._existing_step_runs = self._run.steps
 
         self._steps_to_monitor: Dict[str, "StepRunResponse"] = {}
@@ -240,9 +251,12 @@ class DynamicPipelineRunner:
         self._startup_event = threading.Event()
         self._dependency_graph = InvocationDependencyGraph()
         self._future_registry = FutureRegistry()
+        self._pipeline_outputs: StepRunOutputs = None
 
     def _prepare_run(
-        self, run: Optional["PipelineRunResponse"]
+        self,
+        run: Optional["PipelineRunResponse"],
+        orchestrator_run_id: Optional[str] = None,
     ) -> Tuple["PipelineRunResponse", str]:
         """Prepare the pipeline run.
 
@@ -251,36 +265,41 @@ class DynamicPipelineRunner:
 
         Args:
             run: The pipeline run to prepare.
+            orchestrator_run_id: The orchestrator run ID to use.
 
         Returns:
             The prepared pipeline run and the orchestrator run ID.
         """
-        if run and run.orchestrator_run_id:
-            orchestrator_run_id = run.orchestrator_run_id
+        if orchestrator_run_id:
+            resolved_orchestrator_run_id = orchestrator_run_id
+        elif run and run.orchestrator_run_id:
+            resolved_orchestrator_run_id = run.orchestrator_run_id
         else:
-            orchestrator_run_id = self._orchestrator.get_orchestrator_run_id()
+            resolved_orchestrator_run_id = (
+                self._orchestrator.get_orchestrator_run_id()
+            )
 
         if run and not run.orchestrator_run_id:
             run = Client().zen_store.update_run(
                 run_id=run.id,
                 run_update=PipelineRunUpdate(
-                    orchestrator_run_id=orchestrator_run_id,
+                    orchestrator_run_id=resolved_orchestrator_run_id,
                 ),
             )
         else:
             existing_runs = Client().list_pipeline_runs(
                 snapshot_id=self._snapshot.id,
-                orchestrator_run_id=orchestrator_run_id,
+                orchestrator_run_id=resolved_orchestrator_run_id,
             )
             if existing_runs.total == 1:
                 run = existing_runs.items[0]
             else:
                 run = create_placeholder_run(
                     snapshot=self._snapshot,
-                    orchestrator_run_id=orchestrator_run_id,
+                    orchestrator_run_id=resolved_orchestrator_run_id,
                 )
 
-        return run, orchestrator_run_id
+        return run, resolved_orchestrator_run_id
 
     @property
     def pipeline(self) -> "DynamicPipeline":
@@ -310,6 +329,42 @@ class DynamicPipelineRunner:
             self._pipeline = pipeline
 
         return self._pipeline
+
+    @property
+    def run(self) -> "PipelineRunResponse":
+        """The run executed by this runner.
+
+        Returns:
+            The pipeline run.
+        """
+        return self._run
+
+    @property
+    def snapshot(self) -> "PipelineSnapshotResponse":
+        """The snapshot executed by this runner.
+
+        Returns:
+            The pipeline snapshot.
+        """
+        return self._snapshot
+
+    @property
+    def orchestrator_run_id(self) -> str:
+        """The orchestrator run ID associated with this runner.
+
+        Returns:
+            The orchestrator run ID.
+        """
+        return self._orchestrator_run_id
+
+    @property
+    def orchestrator(self) -> "BaseOrchestrator":
+        """The orchestrator used by this runner.
+
+        Returns:
+            The orchestrator.
+        """
+        return self._orchestrator
 
     def _monitoring_loop(self) -> None:
         """Monitoring loop.
@@ -518,6 +573,8 @@ class DynamicPipelineRunner:
                 try:
                     if isinstance(node, StepNode):
                         self._handle_step_ready(node=node)
+                    elif isinstance(node, SubPipelineNode):
+                        self._handle_subpipeline_ready(node=node)
                     elif isinstance(node, MapNode):
                         self._handle_map_ready(node=node)
                 except Exception as e:
@@ -527,6 +584,14 @@ class DynamicPipelineRunner:
                         )
                         logger.exception(
                             "Failed to start concurrent step `%s`.",
+                            node_id,
+                        )
+                    elif isinstance(node, SubPipelineNode):
+                        self._handle_subpipeline_startup_failed(
+                            node_id=node_id, exception=e
+                        )
+                        logger.exception(
+                            "Failed to start concurrent sub-pipeline `%s`.",
                             node_id,
                         )
                     elif isinstance(node, MapNode):
@@ -662,12 +727,25 @@ class DynamicPipelineRunner:
                     self._orchestrator.run_init_hook(snapshot=self._snapshot)
 
                 params = self.pipeline.configuration.parameters or {}
+                pipeline_return_value: Any = None
+                pipeline_outputs_update: Dict[str, "UUID"] = {}
                 try:
-                    self.pipeline._call_entrypoint(**params)
+                    pipeline_return_value = self.pipeline._call_entrypoint(
+                        **params
+                    )
                     # The pipeline function finished successfully, but some
                     # steps might still be running. We now wait for all of
                     # them and raise any exceptions that occurred.
                     self.wait_until_done_or_failure()
+                    (
+                        self._pipeline_outputs,
+                        pipeline_outputs_update,
+                    ) = prepare_pipeline_output_update(
+                        value=pipeline_return_value,
+                        pipeline_entrypoint=self.pipeline.entrypoint,
+                        valid_step_names=set(self._invocation_ids)
+                        | set(self._existing_step_runs.keys()),
+                    )
                 except _WaitConditionPollTimeout:
                     logger.info("Pausing pipeline run `%s`.", self._run.id)
                     return
@@ -713,8 +791,26 @@ class DynamicPipelineRunner:
                     self._run.id, hydrate=False
                 )
                 if self._run.status == ExecutionStatus.RUNNING:
-                    publish_successful_pipeline_run(self._run.id)
-                    logger.info("Pipeline completed successfully.")
+                    self._run = Client().zen_store.update_run(
+                        run_id=self._run.id,
+                        run_update=PipelineRunUpdate(
+                            status=ExecutionStatus.COMPLETED,
+                            outputs=pipeline_outputs_update,
+                        ),
+                    )
+                    logger.info(
+                        "Pipeline `%s` completed successfully.",
+                        self.snapshot.pipeline.name,
+                    )
+
+    @property
+    def pipeline_outputs(self) -> StepRunOutputs:
+        """Pipeline outputs resolved from the dynamic entrypoint return value.
+
+        Returns:
+            Pipeline outputs as output artifact references.
+        """
+        return self._pipeline_outputs
 
     def _handle_graph_update(self, new_nodes_ready: bool) -> None:
         """Handle a graph update.
@@ -1320,6 +1416,148 @@ class DynamicPipelineRunner:
             value=TypeAdapter(schema).validate_python(condition.result),
         )
 
+    @overload
+    def submit_subpipeline(
+        self,
+        pipeline: "DynamicPipeline",
+        args: Sequence[Any],
+        kwargs: Dict[str, Any],
+        after: Optional[Sequence["AnyStepFuture"]] = None,
+        concurrent: Literal[True] = True,
+    ) -> PipelineFuture: ...
+
+    @overload
+    def submit_subpipeline(
+        self,
+        pipeline: "DynamicPipeline",
+        args: Sequence[Any],
+        kwargs: Dict[str, Any],
+        after: Optional[Sequence["AnyStepFuture"]] = None,
+        concurrent: Literal[False] = False,
+    ) -> StepRunOutputs: ...
+
+    def submit_subpipeline(
+        self,
+        pipeline: "DynamicPipeline",
+        args: Sequence[Any],
+        kwargs: Dict[str, Any],
+        after: Optional[Sequence["AnyStepFuture"]] = None,
+        concurrent: bool = False,
+    ) -> Union[PipelineFuture, StepRunOutputs]:
+        """Submit a sub-pipeline.
+
+        Args:
+            pipeline: Child pipeline to execute.
+            args: Positional pipeline arguments.
+            kwargs: Keyword pipeline arguments.
+            after: Optional dependency futures.
+            concurrent: Whether to run concurrently.
+
+        Returns:
+            The pipeline future for concurrent calls or output artifacts for
+            synchronous calls.
+        """
+        pipeline = pipeline.copy()
+
+        if not concurrent:
+            child_run = self._compile_subpipeline(
+                pipeline=pipeline, args=args, kwargs=kwargs, after=after
+            )
+            return self._run_subpipeline_sync(run=child_run)
+        else:
+            pipeline_node_id = f"pipeline:{uuid4().hex[:8]}"
+            output_names = list(
+                parse_return_type_annotations(pipeline.entrypoint).keys()
+            )
+            pipeline_future = PipelineFuture(output_names=output_names)
+            self._register_concurrent_subpipeline_invocation(
+                node_id=pipeline_node_id,
+                pipeline=pipeline,
+                args=tuple(args),
+                kwargs=kwargs,
+                after=after,
+                future=pipeline_future,
+            )
+            return pipeline_future
+
+    def _compile_subpipeline(
+        self,
+        pipeline: "DynamicPipeline",
+        args: Sequence[Any],
+        kwargs: Dict[str, Any],
+        after: Optional[Sequence["AnyStepFuture"]] = None,
+    ) -> "PipelineRunResponse":
+        inputs = convert_to_keyword_arguments(
+            pipeline.entrypoint, args, kwargs
+        )
+        inputs = await_step_inputs(inputs)
+
+        if after:
+            for future in collect_futures(
+                after=after, expand_map_results=True
+            ):
+                future.wait()
+
+        pipeline.prepare(**inputs)
+        build_id = self.snapshot.build.id if self.snapshot.build else None
+        child_snapshot = pipeline._create_snapshot(
+            skip_schedule_registration=True,
+            build=build_id,
+        )
+        child_orchestrator_run_id = (
+            f"{self.orchestrator_run_id}/sub/{uuid4().hex[:8]}"
+        )
+        child_run = create_placeholder_run(
+            snapshot=child_snapshot,
+            orchestrator_run_id=child_orchestrator_run_id,
+            parent_run_id=self.run.id,
+        )
+        return child_run
+
+    def _run_subpipeline_sync(
+        self, run: "PipelineRunResponse"
+    ) -> StepRunOutputs:
+        runner = DynamicPipelineRunner(
+            snapshot=run.snapshot,
+            run=run,
+            orchestrator=self._orchestrator,
+            orchestrator_run_id=run.orchestrator_run_id,
+        )
+        return runner.run_pipeline()
+
+    def _create_child_subpipeline_runner(
+        self, child_pipeline: "DynamicPipeline"
+    ) -> "DynamicPipelineRunner":
+        """Create a child runner for a sub-pipeline invocation.
+
+        Args:
+            child_pipeline: The prepared child pipeline.
+
+        Returns:
+            The child runner.
+        """
+        build_id = self.snapshot.build.id if self.snapshot.build else None
+        child_snapshot = child_pipeline._create_snapshot(
+            skip_schedule_registration=True,
+            build=build_id,
+        )
+        child_orchestrator_run_id = (
+            f"{self.orchestrator_run_id}/sub/{uuid4().hex[:8]}"
+        )
+        child_run = create_placeholder_run(
+            snapshot=child_snapshot,
+            orchestrator_run_id=child_orchestrator_run_id,
+            parent_run_id=self.run.id,
+        )
+        return DynamicPipelineRunner(
+            snapshot=child_snapshot,
+            run=child_run,
+            orchestrator=self.orchestrator,
+            orchestrator_run_id=child_orchestrator_run_id,
+        )
+
+    # Failure/Shutdown handling
+
     def has_in_progress_work(self) -> bool:
         """Check if there is any in-progress tracked work.
 
@@ -1328,8 +1566,6 @@ class DynamicPipelineRunner:
         """
         return self._future_registry.has_in_progress_work()
 
-    # Failure/Shutdown handling
-
     def wait_until_done_or_failure(self) -> None:
         """Wait until all futures finished or a failure has been detected.
 
@@ -1337,6 +1573,7 @@ class DynamicPipelineRunner:
             BaseException: If a failure has been detected.
         """  # noqa: DOC503
         while True:
+            self._check_unhandled_subpipeline_failures()
             if self._exception:
                 raise self._exception
 
@@ -1346,6 +1583,24 @@ class DynamicPipelineRunner:
                 return
 
             time.sleep(1)
+
+    def _check_unhandled_subpipeline_failures(self) -> None:
+        """Raise on unhandled failures of finished sub-pipeline futures."""
+        for pipeline_future in self._future_registry.get_pipeline_futures():
+            if pipeline_future.running() or pipeline_future.was_awaited:
+                continue
+
+            try:
+                pipeline_future.result()
+            except BaseException as e:
+                self._on_failure_detected(
+                    RuntimeError(
+                        "Detected unhandled sub-pipeline failure. Await "
+                        "pipeline futures to handle child failures explicitly."
+                    )
+                )
+                if self._exception is None:
+                    self._exception = e
 
     def _on_failure_detected(self, exception: BaseException) -> None:
         """Handle any failure that happens during pipeline execution.
@@ -1360,6 +1615,7 @@ class DynamicPipelineRunner:
         """
         steps_to_stop: List["StepRunResponse"] = []
         nodes_to_cancel: List[Union["StepNode", "MapNode"]] = []
+        pipeline_run_ids_to_cancel: List[str] = []
 
         with self._lifecycle_lock:
             if self._failure_detected:
@@ -1372,6 +1628,14 @@ class DynamicPipelineRunner:
             )
             if self._fail_fast:
                 steps_to_stop = list(self._steps_to_monitor.values())
+                pipeline_run_ids_to_cancel = [
+                    pipeline_run_id
+                    for (
+                        pipeline_run_id,
+                        future,
+                    ) in self._future_registry.get_pipeline_futures_with_ids()
+                    if future.running()
+                ]
 
         logger.debug(
             "Initial pipeline failure detected: %s",
@@ -1385,11 +1649,19 @@ class DynamicPipelineRunner:
                     invocation_id=node.node_id,
                     exception=startup_cancelled_exception,
                 )
+            elif isinstance(node, SubPipelineNode):
+                self._future_registry.cancel_pipeline_startup(
+                    pipeline_id=node.node_id,
+                    exception=startup_cancelled_exception,
+                )
             elif isinstance(node, MapNode):
                 self._future_registry.cancel_map_startup(
                     map_id=node.node_id,
                     exception=startup_cancelled_exception,
                 )
+        self._future_registry.cancel_all_pipeline_startup(
+            exception=startup_cancelled_exception
+        )
 
         logger.debug("Startup work cancelled.")
         self._startup_event.set()
@@ -1401,6 +1673,13 @@ class DynamicPipelineRunner:
                 logger.exception("Failed to stop step `%s`.", step_run.name)
 
         logger.debug("Requested stopping of isolated steps.")
+        for pipeline_run_id in pipeline_run_ids_to_cancel:
+            self._future_registry.cancel_pipeline_pending_work(
+                pipeline_id=pipeline_run_id,
+                exception=StartupCancelled(
+                    "Parent dynamic pipeline failed in fail-fast mode."
+                ),
+            )
         self._monitoring_event.set()
 
     def _stop_isolated_step(self, step_run: "StepRunResponse") -> None:
@@ -1434,6 +1713,19 @@ class DynamicPipelineRunner:
         """
         self._on_failure_detected(exception=exception)
         self._future_registry.await_all_no_raise()
+
+    def cancel_pending_work(
+        self, exception: Optional[BaseException] = None
+    ) -> None:
+        """Cancel pending startup work for this runner.
+
+        Args:
+            exception: Optional cancellation exception.
+        """
+        cancellation_exception = exception or StartupCancelled(
+            "Dynamic pipeline runner cancellation requested."
+        )
+        self._on_failure_detected(exception=cancellation_exception)
 
     def _get_step_exception(
         self, step_run: "StepRunResponse"
@@ -1893,6 +2185,184 @@ class DynamicPipelineRunner:
             map_id=map_id, exception=exception
         )
         nodes_ready = self._dependency_graph.mark_node_failed(node_id=map_id)
+        self._handle_graph_update(nodes_ready)
+        self._on_failure_detected(exception=exception)
+
+    # Concurrent sub-pipeline lifecycle
+
+    def _register_concurrent_subpipeline_invocation(
+        self,
+        node_id: str,
+        pipeline: "DynamicPipeline",
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        after: Optional[Sequence["AnyStepFuture"]],
+        future: PipelineFuture,
+    ) -> None:
+        """Register a concurrent sub-pipeline invocation.
+
+        Args:
+            node_id: Dependency graph node ID for the sub-pipeline.
+            pipeline: The child pipeline.
+            args: Positional arguments passed to the child pipeline.
+            kwargs: Keyword arguments passed to the child pipeline.
+            after: Optional upstream futures for startup ordering.
+            future: The sub-pipeline future.
+        """
+        input_kwargs = convert_to_keyword_arguments(
+            pipeline.entrypoint, args, kwargs
+        )
+        upstream_node_ids = _collect_upstream_node_ids(
+            inputs=input_kwargs, after=after
+        )
+
+        with self._lifecycle_lock:
+            if self._failure_detected:
+                future._cancel_startup(
+                    StartupCancelled(
+                        f"Startup for sub-pipeline `{node_id}` was cancelled."
+                    )
+                )
+                return
+            self._future_registry.register_pipeline_future(
+                pipeline_id=node_id,
+                future=future,
+            )
+            nodes_ready = self._dependency_graph.register_subpipeline_node(
+                node_id=node_id,
+                pipeline=pipeline,
+                args=args,
+                kwargs=kwargs,
+                upstream_ids=upstream_node_ids,
+            )
+        self._handle_graph_update(nodes_ready)
+
+    def _handle_subpipeline_ready(self, node: SubPipelineNode) -> None:
+        """Handle a ready sub-pipeline node.
+
+        Args:
+            node: The sub-pipeline node.
+
+        Raises:
+            RuntimeError: If the startup payload is missing.
+        """
+        self._handle_subpipeline_starting(node_id=node.node_id)
+
+        child_run = self._compile_subpipeline(
+            pipeline=node.pipeline,
+            args=node.args,
+            kwargs=node.kwargs,
+            after=None,
+        )
+
+        def _launch_and_wait() -> StepRunOutputs:
+            try:
+                result = self._run_subpipeline_sync(run=child_run)
+            except BaseException as exception:
+                self._handle_subpipeline_execution_failed(
+                    node_id=node.node_id, exception=exception
+                )
+                raise exception
+            else:
+                self._handle_subpipeline_execution_succeeded(
+                    node_id=node.node_id
+                )
+
+            return result
+
+        with self._lifecycle_lock:
+            self._raise_if_startup_cancelled()
+
+            logger.info(
+                "Starting sub-pipeline `%s`",
+                child_run.snapshot.pipeline.name,
+            )
+
+            context = contextvars.copy_context()
+            execution_future = self._executor.submit(
+                context.run, _launch_and_wait
+            )
+
+            def _cancel_child(exception: BaseException) -> None:
+                # TODO
+                # child_runner.cancel_pending_work(exception=exception)
+                pass
+
+            self._handle_subpipeline_startup_succeeded(
+                node_id=node.node_id,
+                execution_future=execution_future,
+                cancel_handle=_cancel_child,
+            )
+
+    def _handle_subpipeline_starting(self, node_id: str) -> None:
+        """Mark a sub-pipeline node as starting in the dependency graph.
+
+        Args:
+            node_id: The sub-pipeline node ID.
+        """
+        nodes_ready = self._dependency_graph.mark_node_starting(
+            node_id=node_id
+        )
+        self._handle_graph_update(nodes_ready)
+
+    def _handle_subpipeline_startup_succeeded(
+        self,
+        node_id: str,
+        execution_future: Future[StepRunOutputs],
+        cancel_handle: Callable[[BaseException], None],
+    ) -> None:
+        """Store a successful sub-pipeline startup in registry and graph.
+
+        Args:
+            node_id: The sub-pipeline node ID.
+            execution_future: The future for the started sub-pipeline.
+            cancel_handle: Callback that cancels the child runner.
+        """
+        self._future_registry.bind_pipeline_execution_future(
+            pipeline_id=node_id,
+            future=execution_future,
+            cancel_handle=cancel_handle,
+        )
+        nodes_ready = self._dependency_graph.mark_node_running(node_id=node_id)
+        self._handle_graph_update(nodes_ready)
+
+    def _handle_subpipeline_startup_failed(
+        self, node_id: str, exception: BaseException
+    ) -> None:
+        """Store a failed sub-pipeline startup in registry and graph.
+
+        Args:
+            node_id: The sub-pipeline node ID.
+            exception: The startup exception.
+        """
+        self._future_registry.fail_pipeline_startup(
+            pipeline_id=node_id, exception=exception
+        )
+        nodes_ready = self._dependency_graph.mark_node_failed(node_id=node_id)
+        self._handle_graph_update(nodes_ready)
+        self._on_failure_detected(exception=exception)
+
+    def _handle_subpipeline_execution_succeeded(self, node_id: str) -> None:
+        """Mark a sub-pipeline node as successfully finished.
+
+        Args:
+            node_id: The sub-pipeline node ID.
+        """
+        nodes_ready = self._dependency_graph.mark_node_succeeded(
+            node_id=node_id
+        )
+        self._handle_graph_update(nodes_ready)
+
+    def _handle_subpipeline_execution_failed(
+        self, node_id: str, exception: BaseException
+    ) -> None:
+        """Mark a sub-pipeline node as failed.
+
+        Args:
+            node_id: The sub-pipeline node ID.
+            exception: The execution exception.
+        """
+        nodes_ready = self._dependency_graph.mark_node_failed(node_id=node_id)
         self._handle_graph_update(nodes_ready)
         self._on_failure_detected(exception=exception)
 

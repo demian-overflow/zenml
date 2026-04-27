@@ -156,6 +156,10 @@ class PipelineRunRequest(ProjectScopedRequest):
         default=None,
         title="The original run ID for a replayed run.",
     )
+    parent_run_id: Optional[UUID] = Field(
+        default=None,
+        title="The parent run ID for a nested sub-pipeline run.",
+    )
 
     @property
     def is_placeholder_request(self) -> bool:
@@ -208,6 +212,10 @@ class PipelineRunUpdate(BaseUpdate):
     exception_info: Optional[ExceptionInfo] = Field(
         default=None,
         title="The exception information of the pipeline run.",
+    )
+    outputs: Optional[Dict[str, UUID]] = Field(
+        default=None,
+        title="Pipeline output artifact version IDs keyed by output name.",
     )
     # TODO: we should maybe have a different update model here, the upper
     #  attributes should only be for internal use
@@ -323,6 +331,10 @@ class PipelineRunResponseMetadata(ProjectScopedResponseMetadata):
         default=None,
         title="Extra information for trigger execution like upstream_run_id etc.",
     )
+    outputs: Dict[str, UUID] = Field(
+        default={},
+        title="Pipeline output artifact version IDs by output name.",
+    )
 
 
 class PipelineRunResponseResources(ProjectScopedResponseResources):
@@ -364,6 +376,10 @@ class PipelineRunResponseResources(ProjectScopedResponseResources):
     original_run: Optional["PipelineRunResponse"] = Field(
         default=None,
         title="The original run that was replayed to create this run.",
+    )
+    parent_run: Optional["PipelineRunResponse"] = Field(
+        default=None,
+        title="The parent run that launched this run as a sub-pipeline.",
     )
     active_wait_condition: Optional["RunWaitConditionResponse"] = Field(
         default=None,
@@ -715,6 +731,15 @@ class PipelineRunResponse(
         return self.get_metadata().trigger_execution_info
 
     @property
+    def outputs(self) -> Dict[str, UUID]:
+        """The `outputs` property.
+
+        Returns:
+            The output artifact version IDs keyed by output name.
+        """
+        return self.get_metadata().outputs
+
+    @property
     def original_run(self) -> Optional["PipelineRunResponse"]:
         """The `original_run` property.
 
@@ -722,6 +747,15 @@ class PipelineRunResponse(
             the value of the property.
         """
         return self.get_resources().original_run
+
+    @property
+    def parent_run(self) -> Optional["PipelineRunResponse"]:
+        """The `parent_run` property.
+
+        Returns:
+            the value of the property.
+        """
+        return self.get_resources().parent_run
 
     @property
     def active_wait_condition(self) -> Optional["RunWaitConditionResponse"]:
@@ -918,6 +952,11 @@ class PipelineRunFilter(
     trigger_id: UUID | str | None = Field(
         default=None,
         description="The ID of the trigger that generated this pipeline run.",
+        union_mode="left_to_right",
+    )
+    parent_run_id: Optional[Union[UUID, str]] = Field(
+        default=None,
+        description="The parent run ID for nested sub-pipeline runs.",
         union_mode="left_to_right",
     )
     model_config = ConfigDict(protected_namespaces=())

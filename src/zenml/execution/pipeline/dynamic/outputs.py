@@ -18,6 +18,8 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future
 from typing import (
     Any,
+    Callable,
+    Dict,
     Generic,
     Iterator,
     List,
@@ -614,6 +616,205 @@ class StepFuture(BaseStepFuture):
             exception: The cancellation exception to store.
         """
         self._set_startup_failed(exception)
+
+
+class PipelineFuture(BaseFuture):
+    """Future for a sub-pipeline run output."""
+
+    def __init__(
+        self,
+        output_names: Optional[List[str]] = None,
+    ) -> None:
+        """Initialize the future.
+
+        Args:
+            output_names: Optional output names of the sub-pipeline run.
+        """
+        self._startup = _StartupResult[Future[StepRunOutputs]]()
+        self._output_names = output_names or []
+        self._was_awaited = False
+        self._cancel_handle: Optional[Callable[[BaseException], None]] = None
+
+    def _set_startup_result(self, wrapped: Future[StepRunOutputs]) -> None:
+        """Store the future that represents the started sub-pipeline run.
+
+        Args:
+            wrapped: The future that resolves to the pipeline outputs.
+        """
+        self._startup.set_result(wrapped)
+
+    def _set_startup_failed(self, exception: BaseException) -> None:
+        """Store a startup exception for the sub-pipeline.
+
+        Args:
+            exception: The startup exception.
+        """
+        self._startup.set_exception(exception)
+
+    def _set_cancel_handle(
+        self, cancel_handle: Callable[[BaseException], None]
+    ) -> None:
+        """Store a cancellation callback for this sub-pipeline run.
+
+        Args:
+            cancel_handle: Callback that cancels pending child work.
+        """
+        self._cancel_handle = cancel_handle
+
+    def _cancel_startup(self, exception: BaseException) -> None:
+        """Cancel sub-pipeline startup if it has not been resolved yet.
+
+        Args:
+            exception: The cancellation exception to store.
+        """
+        self._set_startup_failed(exception)
+
+    def cancel_pending_work(self, exception: BaseException) -> None:
+        """Cancel pending work for this sub-pipeline.
+
+        Args:
+            exception: Cancellation exception to propagate to the child run.
+        """
+        if not self._startup.done():
+            self._cancel_startup(exception)
+            return
+
+        if self._startup.failed():
+            return
+
+        if self._cancel_handle:
+            self._cancel_handle(exception)
+
+    def running(self) -> bool:
+        """Check if the sub-pipeline future is running.
+
+        Returns:
+            True if the future is running, False otherwise.
+        """
+        if not self._startup.done():
+            return True
+        if self._startup.failed():
+            return False
+
+        return not self._startup.result().done()
+
+    def wait(self) -> None:
+        """Wait for the sub-pipeline to finish."""
+        self.result()
+
+    def result(self) -> StepRunOutputs:
+        """Get the sub-pipeline outputs.
+
+        Returns:
+            The sub-pipeline outputs.
+        """
+        self._was_awaited = True
+        return self._startup.result().result()
+
+    def artifacts(self) -> StepRunOutputs:
+        """Get the sub-pipeline output artifacts.
+
+        Returns:
+            The sub-pipeline output artifacts.
+        """
+        return self.result()
+
+    def get_artifact(self, key: str) -> OutputArtifact:
+        """Get an output artifact by output name.
+
+        Args:
+            key: The output name.
+
+        Raises:
+            KeyError: If no output exists for the key.
+
+        Returns:
+            The output artifact.
+        """
+        output_map = self._as_dict()
+        if key not in output_map:
+            raise KeyError(f"Sub-pipeline does not have an output `{key}`.")
+        return output_map[key]
+
+    def _as_tuple(self) -> Tuple[OutputArtifact, ...]:
+        """Normalize outputs to tuple form.
+
+        Returns:
+            Outputs as tuple.
+        """
+        result = self.result()
+        if result is None:
+            return ()
+        if isinstance(result, OutputArtifact):
+            return (result,)
+        return result
+
+    def _as_dict(self) -> Dict[str, OutputArtifact]:
+        """Normalize outputs to dictionary form.
+
+        Returns:
+            Outputs as dictionary keyed by output name.
+        """
+        output_tuple = self._as_tuple()
+        if not output_tuple:
+            return {}
+
+        if self._output_names and len(self._output_names) == len(output_tuple):
+            names = self._output_names
+        elif len(output_tuple) == 1:
+            names = ["output"]
+        else:
+            names = [f"output_{i}" for i in range(len(output_tuple))]
+
+        return {
+            output_name: artifact
+            for output_name, artifact in zip(names, output_tuple)
+        }
+
+    @overload
+    def __getitem__(self, key: int) -> OutputArtifact: ...
+
+    @overload
+    def __getitem__(self, key: slice) -> Tuple[OutputArtifact, ...]: ...
+
+    def __getitem__(
+        self, key: Union[int, slice]
+    ) -> Union[OutputArtifact, Tuple[OutputArtifact, ...]]:
+        """Get output artifact(s) by index.
+
+        Args:
+            key: Index or slice.
+
+        Returns:
+            Output artifact(s).
+        """
+        output_tuple = self._as_tuple()
+        return output_tuple[key]
+
+    def __iter__(self) -> Iterator[OutputArtifact]:
+        """Iterate over output artifacts.
+
+        Yields:
+            Output artifacts.
+        """
+        yield from self._as_tuple()
+
+    def __len__(self) -> int:
+        """Get number of output artifacts.
+
+        Returns:
+            Number of output artifacts.
+        """
+        return len(self._as_tuple())
+
+    @property
+    def was_awaited(self) -> bool:
+        """Whether this future result was explicitly awaited.
+
+        Returns:
+            Whether the future was awaited.
+        """
+        return self._was_awaited
 
 
 class MapResultsFuture(BaseFuture):

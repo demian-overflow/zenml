@@ -15,12 +15,15 @@
 
 import threading
 import time
-from typing import Dict, List, Optional, Union
+from concurrent.futures import Future
+from typing import Callable, Dict, List, Optional, Union
 
 from zenml.execution.pipeline.dynamic.outputs import (
     MapResultsFuture,
+    PipelineFuture,
     StepExecutionFuture,
     StepFuture,
+    StepRunOutputs,
 )
 from zenml.logger import get_logger
 
@@ -39,6 +42,7 @@ class FutureRegistry:
         self._lock = threading.RLock()
         self._step_futures: Dict[str, StepFuture] = {}
         self._map_futures: Dict[str, MapResultsFuture] = {}
+        self._pipeline_futures: Dict[str, PipelineFuture] = {}
 
     def register_step_future(
         self,
@@ -126,6 +130,48 @@ class FutureRegistry:
                 raise KeyError(f"Unknown map future `{map_id}`.")
             return future
 
+    def register_pipeline_future(
+        self, pipeline_id: str, future: PipelineFuture
+    ) -> PipelineFuture:
+        """Register a sub-pipeline future.
+
+        Args:
+            pipeline_id: The child pipeline run ID.
+            future: The pipeline future.
+
+        Raises:
+            RuntimeError: If a future already exists for the run.
+
+        Returns:
+            The registered pipeline future.
+        """
+        with self._lock:
+            if pipeline_id in self._pipeline_futures:
+                raise RuntimeError(
+                    f"Pipeline future for run `{pipeline_id}` already exists."
+                )
+
+            self._pipeline_futures[pipeline_id] = future
+            return future
+
+    def get_pipeline_future(self, pipeline_id: str) -> PipelineFuture:
+        """Get a sub-pipeline future.
+
+        Args:
+            pipeline_id: The child pipeline run ID.
+
+        Raises:
+            KeyError: If the future does not exist.
+
+        Returns:
+            The pipeline future.
+        """
+        with self._lock:
+            future = self._pipeline_futures.get(pipeline_id)
+            if future is None:
+                raise KeyError(f"Unknown pipeline future `{pipeline_id}`.")
+            return future
+
     def bind_step_execution_future(
         self, invocation_id: str, future: StepExecutionFuture
     ) -> None:
@@ -176,7 +222,40 @@ class FutureRegistry:
             future = self.get_map_future(map_id=map_id)
             future._set_startup_failed(exception)
 
-    def get_all_futures(self) -> List[Union[StepFuture, MapResultsFuture]]:
+    def bind_pipeline_execution_future(
+        self,
+        pipeline_id: str,
+        future: Future[StepRunOutputs],
+        cancel_handle: Callable[[BaseException], None],
+    ) -> None:
+        """Bind the execution and cancellation handles to a pipeline future.
+
+        Args:
+            pipeline_id: The child pipeline run ID.
+            future: Future resolving to pipeline outputs.
+            cancel_handle: Callback to cancel pending child work.
+        """
+        with self._lock:
+            pipeline_future = self.get_pipeline_future(pipeline_id=pipeline_id)
+            pipeline_future._set_cancel_handle(cancel_handle)
+            pipeline_future._set_startup_result(future)
+
+    def fail_pipeline_startup(
+        self, pipeline_id: str, exception: BaseException
+    ) -> None:
+        """Store a startup failure for a sub-pipeline.
+
+        Args:
+            pipeline_id: The child pipeline run ID.
+            exception: The startup exception.
+        """
+        with self._lock:
+            pipeline_future = self.get_pipeline_future(pipeline_id=pipeline_id)
+            pipeline_future._set_startup_failed(exception)
+
+    def get_all_futures(
+        self,
+    ) -> List[Union[StepFuture, MapResultsFuture, PipelineFuture]]:
         """Return all tracked futures.
 
         Returns:
@@ -186,7 +265,28 @@ class FutureRegistry:
             return [
                 *self._step_futures.values(),
                 *self._map_futures.values(),
+                *self._pipeline_futures.values(),
             ]
+
+    def get_pipeline_futures(self) -> List[PipelineFuture]:
+        """Return all tracked sub-pipeline futures.
+
+        Returns:
+            A snapshot of all tracked sub-pipeline futures.
+        """
+        with self._lock:
+            return list(self._pipeline_futures.values())
+
+    def get_pipeline_futures_with_ids(
+        self,
+    ) -> List[tuple[str, PipelineFuture]]:
+        """Return all tracked sub-pipeline futures keyed by run ID.
+
+        Returns:
+            A snapshot of `(pipeline_run_id, future)` tuples.
+        """
+        with self._lock:
+            return list(self._pipeline_futures.items())
 
     def await_all_no_raise(self) -> None:
         """Wait for all tracked futures to finish without raising."""
@@ -263,3 +363,45 @@ class FutureRegistry:
         with self._lock:
             map_future = self.get_map_future(map_id=map_id)
             map_future._cancel_startup(exception)
+
+    def cancel_pipeline_startup(
+        self,
+        pipeline_id: str,
+        exception: Optional[StartupCancelled] = None,
+    ) -> None:
+        """Cancel startup for a specific sub-pipeline.
+
+        Args:
+            pipeline_id: The child pipeline run ID.
+            exception: Optional exception to set on the future. If not
+                provided, a generic cancellation exception is used.
+        """
+        exception = exception or StartupCancelled(
+            f"Startup for sub-pipeline `{pipeline_id}` was cancelled."
+        )
+        with self._lock:
+            pipeline_future = self.get_pipeline_future(pipeline_id=pipeline_id)
+            pipeline_future._cancel_startup(exception)
+
+    def cancel_pipeline_pending_work(
+        self, pipeline_id: str, exception: StartupCancelled
+    ) -> None:
+        """Cancel pending work for a specific tracked sub-pipeline.
+
+        Args:
+            pipeline_id: The child pipeline run ID.
+            exception: Cancellation exception propagated to the child run.
+        """
+        with self._lock:
+            pipeline_future = self.get_pipeline_future(pipeline_id=pipeline_id)
+            pipeline_future.cancel_pending_work(exception)
+
+    def cancel_all_pipeline_startup(self, exception: StartupCancelled) -> None:
+        """Cancel startup for all tracked sub-pipeline futures.
+
+        Args:
+            exception: Cancellation exception to propagate.
+        """
+        with self._lock:
+            for pipeline_future in self._pipeline_futures.values():
+                pipeline_future._cancel_startup(exception)
